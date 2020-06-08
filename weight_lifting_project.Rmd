@@ -1,0 +1,197 @@
+---
+title: "Machine Learning on Weight Lifting Dataset"
+author: "Nguyen Son Linh"
+date: "6/8/2020"
+output: 
+    html_document:
+        fig_height: 4
+        theme: spacelab
+    pdf_document: default
+---
+
+# Executive summary  
+This project aims to predict how well a participant does the weight lifting excercise using data from accelerometers on their body.  
+
+Consequently, feedback can be given to improve performance.  
+
+# Setup  
+
+## Packages
+```{r load_packages, message=FALSE}
+library(caret)
+library(knitr)
+library(rpart)
+library(randomForest)
+library(ggplot2)
+library(dplyr)
+```
+
+For this project, we are going to need some machine learning packages and ggplot2 for better visualisation.  
+
+## Data  
+
+```{r load_data}
+if (!file.exists("pml-training.csv")) 
+  { download.file("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv", 
+  destfile="./pml-training.csv")
+  }
+if (!file.exists("pml-testing.csv")) 
+  { download.file("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv", 
+  destfile="./pml-testing.csv")
+  }
+training <- read.csv("pml-training.csv")
+testing <- read.csv("pml-testing.csv")
+```
+
+***  
+
+# Analysis  
+
+## About the data set  
+
+The data is sourced from http://groupware.les.inf.puc-rio.br/har.  
+
+As per the description, 6 male participants in the 20-28 age group were asked perform one set of 10 repetitions of the Unilateral Dumbbell Biceps Curl in five different fashions, with the first one the correct way:  
+- exactly according to the specification (Class A)  
+- throwing the elbows to the front (Class B)  
+- lifting the dumbbell only halfway (Class C)   
+- lowering the dumbbell only halfway (Class D)   
+- throwing the hips to the front (Class E)  
+
+Sensors were attached to the dumbbell, participants' arm, forearm and belt. Each sensor in their sliding window collected data for:  
+- Euler angles (roll, pitch and yaw)  
+- For each Euler angle: mean, variance, standard deviation, max, min, amplitude, kurtosis and skewness  
+- Raw accelerometer, gyroscope and magnetometer readings  
+
+***
+
+## Exploratory analysis
+There are `r dim(training)[1]` observations and `r dim(training)[2]` variables in the **pmltrain** dataset.
+
+There are `r dim(testing)[1]` observations and `r dim(testing)[2]` variables in the **pmltest** dataset.
+
+The data has already been divided into training and testing sets, however we would expect a higher ratio instead of the given test set of `r dim(testing)[1]` observations. Additionally the **pmltest** does not have the outcome variable _classe- therefore will be used in the final prediction 'test'. 
+
+*After EDA, the training dataset will be splitted into training and testing dataset.*  
+
+Now we will look at some statistics about the classe variable and predictors.  
+
+```{r classe_summary}
+# Convert to factor
+training$classe <- as.factor(training$classe)
+
+kable(summary(training$classe))
+```
+
+It is easily seen that A is the most frequent class.  
+
+```{r participant}
+training %>% ggplot(aes(user_name)) +
+    geom_bar(aes(fill = classe)) + 
+    theme_minimal()
+```
+
+From the above barplot, participant does not seem to be a factor.  
+
+```{r feature_plot}
+featurePlot(x = training[,c("total_accel_belt", "total_accel_arm", "total_accel_dumbbell","total_accel_forearm")], 
+            y = training$classe, 
+            plot = "density",
+            type = c("p", "smooth"),
+            auto.key = list(columns = 5))
+```
+
+It appears that the total acceleration curves are bimodal with peaks.  
+
+## Modeling  
+
+First, we split the training data into train and test sets. Also rename the original testing data.  
+```{r data_partitioning}
+quiz_data <- testing
+inTrain <- createDataPartition(training$classe, p = 0.6, list = F)
+testing <- training[-inTrain, ]
+training <- training[inTrain, ]
+```
+
+Now we clean the data to remove unnecessary variables.
+
+```{r clean_data}
+testing <- testing %>% 
+  select(starts_with("total") | starts_with("accel") | classe |
+         starts_with("pitch") | starts_with("roll") | new_window |
+         starts_with("yaw") | num_window)
+
+training <- training %>% 
+  select(starts_with("total") | starts_with("accel") | classe |
+         starts_with("pitch") | starts_with("roll") | new_window |
+         starts_with("yaw") | num_window)
+```
+
+Near-zero variance covariates shall also be removed.  
+
+```{r nsv}
+nsv <- nearZeroVar(training, saveMetrics = T)
+kable(nsv[nsv$nzv == T, ])
+
+training <- training %>%
+  select(-starts_with("new_window"))
+
+testing <- testing %>%
+  select(-starts_with("new_window"))
+```
+
+
+Any integer values now must be converted to numeric for modelling to work.  
+```{r converting_integer_numeric}
+index <- which(names(training) == "classe")
+training[, -index] <- lapply(training[, -index], as.numeric)
+
+testing[, -index] <- lapply(testing[, -index], as.numeric)
+```
+
+Highly correlateed variables should be reweighted. Cutoff is chosen at 0.8 .  
+
+```{r high_correl}
+cors <-  abs(cor(training[, -index]))
+high_cors <- findCorrelation(cors, cutoff = .8)
+kable(training[0, high_cors])
+```
+
+We can utilise the preProcess function of the caret package to do that.  
+
+```{r preprocessing}
+preProc <- preProcess(training, method = c("center", "scale"))
+
+preProc
+```
+
+Imputation and dummy variables are not needed here since all predictors left are numerical.  
+
+**MODEL BUILDING**  
+
+From our EDA we can deduce that a non-linear model is required as we know the outcome variable, i.e *classe*.  
+
+With the vastness of the data, classification tree and random forest are the two most promsing methods.  
+
+Let's attempt the classification tree method.  
+```{r classification_tree}
+set.seed(123)
+model_tree <- rpart(classe ~ ., data = training, method = "class")
+predictions_tree <- predict(model_tree, testing, type = "class")
+```
+
+The accuracy of this method is `r confusionMatrix(testing$classe,predictions_tree)$overall['Accuracy']`  
+
+Time for random foresting. We do bootstrapping here as well as k-fold cross validation.  
+
+```{r random_forest}
+trControl <- trainControl(method = "cv", number = 3)
+model_forest <- train(classe ~ ., data = training, method = "rf", 
+                      trControl = trControl)
+```
+
+The accuracy for the random forest is `r confusionMatrix(testing$classe,predict(model_forest,testing))$overall['Accuracy']`.
+
+## Conclusion  
+- We built 2 models and come to a conclusion that random forest is much more predictive, albeit more time-consuming. 
+- Based on the estimated accuracy, the chance of missclassification using the random forest model is slim.
